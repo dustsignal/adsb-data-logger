@@ -18,67 +18,28 @@ from collections import OrderedDict
 import contextlib
 from typing import Dict, Any, Optional
 
-# --- CORE CONFIGURATION ---
-# These settings can be configured via environment variables or modified directly.
+# --- CONFIGURATION MANAGEMENT ---
 class Config:
     def __init__(self):
-        # URL to your ADSB receiver's aircraft.json file.
-        self.AIRCRAFT_JSON_PATH = os.getenv('AIRCRAFT_JSON_PATH', 'path/to/aircraft.json')
-        # URL to your ADSB receiver's aircraft.csv file for registration/type lookups. You may need to run dump1090-fa or tar1090 scripts to generate this file. Reference their githubs for how.
-        self.AIRCRAFT_CSV_PATH = os.getenv('AIRCRAFT_CSV_PATH', 'path/to/aircraft.csv')
-        # Time in seconds between database uploads.
+        # Default configuration
+        self.AIRCRAFT_JSON_PATH = os.getenv('AIRCRAFT_JSON_PATH', 'your-path/aircraft.json')
+        self.AIRCRAFT_CSV_PATH = os.getenv('AIRCRAFT_CSV_PATH', 'your-path/aircraft.csv')
         self.SUMMARY_UPLOAD_INTERVAL = int(os.getenv('SUMMARY_UPLOAD_INTERVAL', '300'))
-        # Maximum number of aircraft to hold in memory before forcing an upload.
         self.MAX_CACHE_SIZE = int(os.getenv('MAX_CACHE_SIZE', '200'))
-        # Maximum number of retries for failed database operations.
         self.MAX_RETRY_ATTEMPTS = int(os.getenv('MAX_RETRY_ATTEMPTS', '3'))
-        # Delay in seconds between retries.
         self.RETRY_DELAY = int(os.getenv('RETRY_DELAY', '10'))
-        # Time in seconds before a cached aircraft record is considered expired.
         self.CACHE_TTL_SECONDS = int(os.getenv('CACHE_TTL_SECONDS', '3600'))  # 1 hour TTL
-        # Time in seconds to cache the aircraft registry CSV file.
         self.AIRCRAFT_CSV_TTL_SECONDS = int(os.getenv('AIRCRAFT_CSV_TTL_SECONDS', '86400'))  # 24 hour TTL for CSV cache
-        # Number of connections to keep in the database pool.
         self.DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
-        # Number of consecutive failures before opening the circuit breaker.
         self.CIRCUIT_BREAKER_THRESHOLD = int(os.getenv('CIRCUIT_BREAKER_THRESHOLD', '5'))
-        # Time in seconds to wait before moving the circuit breaker to HALF_OPEN.
         self.CIRCUIT_BREAKER_TIMEOUT = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT', '60'))
-        # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
         self.LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-        # Log file name.
         self.LOG_FILE = os.getenv('LOG_FILE', 'adsb_logger.log')
-        # Max log file size in bytes.
         self.LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', '10485760'))  # 10MB
-        # Number of old log files to keep.
         self.LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+        self.LOG_CLEANUP_INTERVAL_HOURS = int(os.getenv('LOG_CLEANUP_INTERVAL_HOURS', '48'))  # 48 hours
 
 config = Config()
-
-# --- DATABASE CONFIGURATION ---
-# Replace with your MySQL database credentials.
-DB_CONFIG = {
-    'user': os.getenv('DB_USER', 'your_db_user'),
-    'password': os.getenv('DB_PASSWORD', 'your_db_password'),
-    'host': os.getenv('DB_HOST', '127.0.0.1'),
-    'database': os.getenv('DB_NAME', 'adsb_data'),
-    'raise_on_warnings': False,
-    'connection_timeout': 30,
-    'autocommit': False,
-    'charset': 'utf8mb4',
-    'use_unicode': True,
-    'sql_mode': ''
-}
-
-# --- EMAIL NOTIFICATION CONFIGURATION ---
-# Replace with your SMTP server details for failure notifications.
-# Set SENDER_EMAIL to an empty string to disable email notifications.
-SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.example.com')
-SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
-SENDER_EMAIL = os.getenv('SENDER_EMAIL', 'sender@example.com')
-SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', 'your_email_password')
-RECEIVER_EMAIL = os.getenv('RECEIVER_EMAIL', 'receiver@example.com')
-
 
 # --- VISUAL FORMATTING CLASSES ---
 class Colors:
@@ -130,11 +91,12 @@ class ApplicationFormatter(logging.Formatter):
         self.dashboard_initialized = False
         self.last_refresh_time = 0
         self.status_change_timer = None
-        self._refresh_lock = threading.RLock()  # Use RLock for better thread safety
-        self._state_lock = threading.Lock()  # Separate lock for state management
+        self._main_lock = threading.RLock()  # Single main lock to prevent deadlocks
         self._dashboard_update_pending = False
         self._cursor_position_saved = False
         self._consolidation_timer = None
+        self._timer_lock = threading.Lock()  # Separate lock only for timer management
+        self._terminal_initialized = False
 
     def format(self, record):
         # Get timestamp
@@ -164,15 +126,21 @@ class ApplicationFormatter(logging.Formatter):
         if any(dynamic in msg for dynamic in [
             "Data collection:",
             "Cache status:",
-            "Initiating summary data upload",
+            "Initiating summary",  # Catches both "Initiating summary data upload" and "Initiating scheduled summary"
             "SUCCESS: Committed",
-            "Health check:"
+            "Health check:",
+            "Summary upload complete",
+            "Finished processing",
+            "Processing"
         ]):
             self._handle_dynamic_message(timestamp, msg)
             return ""  # Return empty to prevent double printing
         elif "Sleeping for" in msg:
-            # For sleep messages, just update status without refresh (refresh will happen via timer)
-            ApplicationFormatter.current_status = "STANDBY"
+            # For sleep messages, update status and force a refresh to show STANDBY
+            with self._main_lock:
+                ApplicationFormatter.current_status = "STANDBY"
+                self._dashboard_update_pending = True
+            self._schedule_consolidated_refresh()
             return ""
 
         # Handle errors and warnings normally
@@ -245,8 +213,14 @@ class ApplicationFormatter(logging.Formatter):
         # Determine message type and only process significant changes
         msg_type = self._determine_message_type(msg)
 
-        # Use atomic state update
-        with self._state_lock:
+        # Debug logging for critical upload messages
+        if msg_type in ["upload_success", "upload_complete"]:
+            import logging
+            logger = logging.getLogger('adsb_logger.formatter')
+            logger.debug(f"Handling critical message type '{msg_type}': {msg[:50]}...")
+
+        # Use single main lock to prevent deadlocks
+        with self._main_lock:
             self._build_dashboard(timestamp, msg, msg_type)
             # Mark that an update is pending instead of immediately refreshing
             self._dashboard_update_pending = True
@@ -262,10 +236,16 @@ class ApplicationFormatter(logging.Formatter):
             return "upload_start"
         elif "SUCCESS: Committed" in msg:
             return "upload_success"
+        elif "Summary upload complete" in msg:
+            return "upload_complete"
         elif "Health check:" in msg:
             return "health"
         elif "Data collection:" in msg:
             return "data"
+        elif "Processing" in msg:
+            return "processing"
+        elif "Finished processing" in msg:
+            return "processing_complete"
         else:
             return "other"
 
@@ -276,17 +256,13 @@ class ApplicationFormatter(logging.Formatter):
 
     def _schedule_status_change(self, new_status, delay_seconds):
         """Schedule a status change after a delay with consolidated refresh"""
-        # Initialize timer lock if not exists
-        if not hasattr(self, '_timer_lock'):
-            self._timer_lock = threading.Lock()
-
         with self._timer_lock:
             # Cancel any existing timer
             if hasattr(self, 'status_change_timer') and self.status_change_timer:
                 self.status_change_timer.cancel()
 
             def change_status():
-                with self._state_lock:
+                with self._main_lock:
                     ApplicationFormatter.current_status = new_status
                     self._dashboard_update_pending = True
                 # Use consolidated refresh instead of direct refresh
@@ -302,16 +278,24 @@ class ApplicationFormatter(logging.Formatter):
         import time
         import threading
 
-        if not hasattr(self, '_consolidation_timer') or not self._consolidation_timer:
-            def consolidated_refresh():
-                time.sleep(0.1)  # Small delay to allow multiple updates to consolidate
-                with self._state_lock:
-                    if self._dashboard_update_pending:
-                        self._dashboard_update_pending = False
-                        self._refresh_dashboard()
-                    self._consolidation_timer = None
+        with self._timer_lock:
+            # Cancel any existing consolidation timer
+            if self._consolidation_timer and self._consolidation_timer.is_alive():
+                self._consolidation_timer.cancel()
 
-            self._consolidation_timer = threading.Timer(0.1, consolidated_refresh)
+            def consolidated_refresh():
+                time.sleep(0.05)  # Reduced delay for more responsive updates
+                # Use try-finally to ensure timer cleanup
+                try:
+                    with self._main_lock:
+                        if self._dashboard_update_pending:
+                            self._dashboard_update_pending = False
+                            self._refresh_dashboard()
+                finally:
+                    with self._timer_lock:
+                        self._consolidation_timer = None
+
+            self._consolidation_timer = threading.Timer(0.05, consolidated_refresh)
             self._consolidation_timer.daemon = True
             self._consolidation_timer.start()
 
@@ -320,36 +304,59 @@ class ApplicationFormatter(logging.Formatter):
         import sys
         import time
 
-        # Use blocking lock to ensure atomic refresh operations
-        with self._refresh_lock:
-            current_time = time.time()
-            # Reduced throttling time and more reliable refresh
-            if current_time - self.last_refresh_time < 1.0:
-                return
-            self.last_refresh_time = current_time
+        # This method should only be called when _main_lock is already held
+        current_time = time.time()
+        # Reduced throttling time and more reliable refresh
+        if current_time - self.last_refresh_time < 0.5:
+            return
+        self.last_refresh_time = current_time
 
-            try:
-                # Save cursor position if not already saved
-                if not self._cursor_position_saved:
-                    sys.stdout.write("\033[s")  # Save cursor position
-                    self._cursor_position_saved = True
+        try:
+            # Initialize terminal state properly on first use
+            if not self._terminal_initialized:
+                # Simple terminal initialization without alternate screen buffer
+                sys.stdout.write("\033[s")     # Save initial cursor position
+                self._terminal_initialized = True
+                self._cursor_position_saved = True
 
-                # Move cursor to saved position and clear screen from cursor down
-                sys.stdout.write("\033[u")  # Restore cursor position
+            # Restore to saved position and clear from cursor down
+            if self._cursor_position_saved:
+                sys.stdout.write("\033[u")  # Restore to saved position
                 sys.stdout.write("\033[0J")  # Clear from cursor to end of screen
+            else:
+                # Fallback: just clear from current position
+                sys.stdout.write("\033[0J")
 
-                # Get the current dashboard content
-                dashboard = self._get_current_dashboard()
+            # Get the current dashboard content
+            dashboard = self._get_current_dashboard()
 
-                # Write the complete dashboard atomically
-                sys.stdout.write(dashboard)
+            # Write the complete dashboard atomically
+            sys.stdout.write(dashboard)
+            sys.stdout.flush()
+
+            # Save position after successful update only if we don't have one saved already
+            if not self._cursor_position_saved:
+                sys.stdout.write("\033[s")
+                self._cursor_position_saved = True
+
+            # Debug logging for successful refreshes during critical periods
+            import logging
+            logger = logging.getLogger('adsb_logger.formatter')
+            if hasattr(ApplicationFormatter, 'current_status') and "UPLOAD" in ApplicationFormatter.current_status:
+                logger.debug(f"Dashboard refresh successful during: {ApplicationFormatter.current_status}")
+
+        except Exception as e:
+            # Log error but don't crash the application
+            import logging
+            logger = logging.getLogger('adsb_logger.formatter')
+            logger.debug(f"Dashboard refresh error: {e}")
+            # Minimal terminal recovery - don't reset everything
+            try:
+                sys.stdout.write("\033[0J")  # Clear from cursor down
                 sys.stdout.flush()
-
-            except Exception as e:
-                # Log error but don't crash the application
-                import logging
-                logger = logging.getLogger('adsb_logger.formatter')
-                logger.debug(f"Dashboard refresh error: {e}")
+                logger.debug("Terminal display cleared after refresh error")
+            except Exception as reset_error:
+                logger.debug(f"Failed to clear terminal display: {reset_error}")
 
     def _get_current_dashboard(self):
         """Get the current mainframe-style technical dashboard display"""
@@ -423,7 +430,7 @@ class ApplicationFormatter(logging.Formatter):
         line2 = line2.replace(ApplicationFormatter.last_active_count.rjust(4), f"{Colors.BOLD}{ApplicationFormatter.last_active_count.rjust(4)}{Colors.RESET}")
 
         line3 = line3_padded.replace(ApplicationFormatter.last_data_collection_time.ljust(8), f"{Colors.YELLOW}{ApplicationFormatter.last_data_collection_time.ljust(8)}{Colors.RESET}")
-        line3 = line3_padded.replace(ApplicationFormatter.last_database_upload_time.ljust(8), f"{Colors.YELLOW}{ApplicationFormatter.last_database_upload_time.ljust(8)}{Colors.RESET}")
+        line3 = line3.replace(ApplicationFormatter.last_database_upload_time.ljust(8), f"{Colors.YELLOW}{ApplicationFormatter.last_database_upload_time.ljust(8)}{Colors.RESET}")
 
         # Get aircraft list for display
         aircraft_display = self._get_aircraft_display()
@@ -539,8 +546,23 @@ class ApplicationFormatter(logging.Formatter):
             commit_count = match.group(1) if match else "0"
             ApplicationFormatter.current_status = f"UPLOAD SUCCESS ({commit_count} records)"
             ApplicationFormatter.last_database_upload_time = timestamp
-            # Keep success status visible for 5 seconds (longer for important info)
-            self._schedule_status_change("STANDBY", 5.0)
+            # Keep success status visible for 3 seconds, then transition to upload complete
+            self._schedule_status_change("UPLOAD COMPLETE", 3.0)
+
+        elif msg_type == "upload_complete":
+            ApplicationFormatter.current_status = "UPLOAD COMPLETE"
+            # Keep this status visible for 2 seconds before going to standby
+            self._schedule_status_change("STANDBY", 2.0)
+
+        elif msg_type == "processing":
+            ApplicationFormatter.current_status = "PROCESSING DATA"
+            # Keep this status visible for 2 seconds
+            self._schedule_status_change("STANDBY", 2.0)
+
+        elif msg_type == "processing_complete":
+            ApplicationFormatter.current_status = "PROCESSING COMPLETE"
+            # Keep this status visible for 2 seconds
+            self._schedule_status_change("STANDBY", 2.0)
 
         elif msg_type == "health":
             ApplicationFormatter.current_status = "HEALTH CHECK"
@@ -591,6 +613,93 @@ class ApplicationFormatter(logging.Formatter):
 
     def _format_info(self, timestamp, msg):
         return f"{Colors.BOLD}[{timestamp}]{Colors.RESET} ℹ️  {Colors.BLUE}INFO{Colors.RESET}        │ {msg}"
+
+# --- DATABASE CONFIGURATION ---
+DB_CONFIG = {
+    'user': os.getenv('DB_USER', 'jcellaco_mom-z14'),
+    'password': os.getenv('DB_PASSWORD', 'ReUHA6QTyW2yjcQ'),
+    'host': os.getenv('DB_HOST', 'rs2-va.serverhostgroup.com'),
+    'database': os.getenv('DB_NAME', 'jcellaco_adsb-prtr'),
+    'raise_on_warnings': False,
+    'connection_timeout': 30,
+    'autocommit': False,
+    'charset': 'utf8mb4',
+    'use_unicode': True,
+    'sql_mode': ''
+}
+
+# --- EMAIL NOTIFICATION CONFIGURATION ---
+SMTP_SERVER = os.getenv('SMTP_SERVER', 'mail.coldwararchive.com')
+SMTP_PORT = int(os.getenv('SMTP_PORT', '465'))
+SENDER_EMAIL = os.getenv('SENDER_EMAIL', 'atomic@coldwararchive.com')
+SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', 'D0]f]7NqVN#wmBfO')
+RECEIVER_EMAIL = os.getenv('RECEIVER_EMAIL', 'altair.dracolich@gmail.com')
+
+# --- LOG FILE MANAGEMENT ---
+class LogFileManager:
+    """Manages log file cleanup operations."""
+
+    def __init__(self, log_file_path: str, cleanup_interval_hours: int = 48):
+        self.log_file_path = log_file_path
+        self.cleanup_interval_seconds = cleanup_interval_hours * 3600
+        self.last_cleanup_time = time.time()
+        self.logger = logging.getLogger('adsb_logger.logmanager')
+        self._cleanup_lock = threading.Lock()
+
+    def should_cleanup(self) -> bool:
+        """Check if it's time for log cleanup."""
+        current_time = time.time()
+        return (current_time - self.last_cleanup_time) >= self.cleanup_interval_seconds
+
+    def cleanup_log_file(self) -> bool:
+        """Empty the log file and reset the cleanup timer."""
+        with self._cleanup_lock:
+            try:
+                # Get current log file size before cleanup
+                try:
+                    file_size = os.path.getsize(self.log_file_path)
+                    file_size_mb = file_size / (1024 * 1024)
+                except (OSError, FileNotFoundError):
+                    file_size_mb = 0
+
+                # Create backup timestamp
+                cleanup_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                # Write cleanup marker before emptying
+                cleanup_marker = f"\n{'='*80}\n"
+                cleanup_marker += f"LOG FILE CLEANUP PERFORMED: {cleanup_timestamp}\n"
+                cleanup_marker += f"Previous log size: {file_size_mb:.2f} MB\n"
+                cleanup_marker += f"Cleanup interval: {self.cleanup_interval_seconds/3600:.0f} hours\n"
+                cleanup_marker += f"{'='*80}\n\n"
+
+                # Empty the log file by opening in write mode
+                with open(self.log_file_path, 'w', encoding='utf-8') as f:
+                    f.write(cleanup_marker)
+
+                # Update cleanup time
+                self.last_cleanup_time = time.time()
+
+                # Log the cleanup action (this will go to the newly emptied file)
+                self.logger.debug(f"Log file cleanup completed - freed {file_size_mb:.2f} MB")
+
+                return True
+
+            except Exception as e:
+                self.logger.error(f"Failed to cleanup log file: {e}")
+                return False
+
+    def get_cleanup_status(self) -> dict:
+        """Get information about cleanup status."""
+        current_time = time.time()
+        time_since_cleanup = current_time - self.last_cleanup_time
+        time_until_cleanup = self.cleanup_interval_seconds - time_since_cleanup
+
+        return {
+            'cleanup_interval_hours': self.cleanup_interval_seconds / 3600,
+            'hours_since_cleanup': time_since_cleanup / 3600,
+            'hours_until_cleanup': max(0, time_until_cleanup / 3600),
+            'cleanup_needed': self.should_cleanup()
+        }
 
 # --- LOGGING SETUP ---
 def setup_logging() -> logging.Logger:
@@ -957,11 +1066,13 @@ class ADSBLogger:
         self.db_manager = DatabaseManager(DB_CONFIG)
         self.api_circuit_breaker = CircuitBreaker()
         self.db_circuit_breaker = CircuitBreaker()
+        self.log_manager = LogFileManager(config.LOG_FILE, config.LOG_CLEANUP_INTERVAL_HOURS)
         self.setup_signal_handlers()
 
         self.logger.info("ADSB Logger initialized with production features")
         self.logger.info(f"Configuration: Upload interval={config.SUMMARY_UPLOAD_INTERVAL}s, Cache size={config.MAX_CACHE_SIZE}, TTL={config.CACHE_TTL_SECONDS}s")
         self.logger.info(f"Aircraft registry CSV TTL: {config.AIRCRAFT_CSV_TTL_SECONDS}s")
+        self.logger.info(f"Log cleanup interval: {config.LOG_CLEANUP_INTERVAL_HOURS} hours")
 
     def setup_signal_handlers(self):
         """Set up graceful shutdown signal handlers."""
@@ -1267,6 +1378,15 @@ class ADSBLogger:
                 # Always show cache status at INFO level for monitoring
                 self.logger.info(f"Cache status: {cache_size} total aircraft cached, {len(current_hexes)} currently active")
 
+                # Check for log file cleanup (every cycle, but only acts if needed)
+                if self.log_manager.should_cleanup():
+                    self.logger.debug("Log file cleanup is due - performing 48-hour log file maintenance...")
+                    cleanup_success = self.log_manager.cleanup_log_file()
+                    if cleanup_success:
+                        self.logger.debug("Log file cleanup completed successfully")
+                    else:
+                        self.logger.debug("Log file cleanup failed - will retry in next cycle")
+
                 # Check if it's time to upload the summary
                 should_upload = (current_time - self.last_summary_upload_time >= config.SUMMARY_UPLOAD_INTERVAL or
                                 cache_size >= config.MAX_CACHE_SIZE or
@@ -1310,13 +1430,15 @@ class ADSBLogger:
                 # Log system health periodically
                 if int(current_time) % 300 == 0:  # Every 5 minutes
                     registry_stats = self.aircraft_registry.get_cache_stats()
+                    log_cleanup_stats = self.log_manager.get_cleanup_status()
                     health_stats = {
                         'cache_size': cache_size,
                         'api_circuit': self.api_circuit_breaker.get_state(),
                         'db_circuit': self.db_circuit_breaker.get_state(),
                         'registry_aircraft_count': registry_stats['total_aircraft'],
                         'registry_cache_age_hours': round(registry_stats['cache_age_seconds'] / 3600, 1),
-                        'uptime_minutes': int((current_time - self.last_summary_upload_time) / 60)
+                        'uptime_minutes': int((current_time - self.last_summary_upload_time) / 60),
+                        'log_cleanup_hours_until': round(log_cleanup_stats['hours_until_cleanup'], 1)
                     }
                     self.logger.info(f"Health check: {health_stats}")
 
@@ -1359,6 +1481,265 @@ class ADSBLogger:
 
         self.logger.info("ADSB Logger shutdown complete.")
         logging.shutdown()
+
+# Legacy function kept for backward compatibility
+def send_failure_email(error_message):
+    """Legacy function - use ADSBLogger.send_failure_email instead."""
+    logger = logging.getLogger('adsb_logger')
+    logger.warning("Using legacy send_failure_email function - consider updating to use ADSBLogger class")
+
+    if not SENDER_EMAIL or "your_email" in SENDER_EMAIL:
+        logger.warning("Email not configured. Skipping notification.")
+        return
+
+    message = MIMEMultipart("alternative")
+    message["Subject"] = "ADSB Logger: Database Operation FAILED"
+    message["From"] = SENDER_EMAIL
+    message["To"] = RECEIVER_EMAIL
+    text = f"The ADSB logger script failed a database operation.\n\nError details:\n{error_message}"
+    html = f"""
+    <html><body>
+        <h2>ADSB Logger: Database Operation Failure</h2>
+        <p>The script encountered an error. Please check the server and script logs.</p>
+        <h3>Error Details:</h3>
+        <pre style="background-color:#f0f0f0; border:1px solid #ddd; padding:10px; border-radius:5px;"><code>{error_message}</code></pre>
+    </body></html>
+    """
+    part1 = MIMEText(text, "plain")
+    part2 = MIMEText(html, "html")
+    message.attach(part1)
+    message.attach(part2)
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, message.as_string())
+            logger.info("Successfully sent failure notification email.")
+    except Exception as e:
+        logger.error(f"Failed to send email notification: {e}")
+
+# Legacy function kept for backward compatibility
+def validate_aircraft_data(aircraft):
+    """Legacy function - use ADSBLogger.validate_aircraft_data instead."""
+    if not isinstance(aircraft, dict): return False
+    hex_code = aircraft.get('hex')
+    if not hex_code or not isinstance(hex_code, str): return False
+    # Validate numeric fields
+    numeric_fields = ['alt_baro', 'gs', 'track', 'baro_rate', 'messages', 'seen', 'lat', 'lon']
+    for field in numeric_fields:
+        if field in aircraft and aircraft[field] is not None and not isinstance(aircraft[field], (int, float)):
+            return False
+    return True
+
+# Legacy function kept for backward compatibility
+def read_aircraft_json(path):
+    """Legacy function - use ADSBLogger.read_aircraft_json instead."""
+    try:
+        if path.startswith('http://') or path.startswith('https://'):
+            response = requests.get(path, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        else:
+            with open(path, 'r') as f: data = json.load(f)
+        aircraft_list = data.get('aircraft', [])
+        valid_aircraft = [ac for ac in aircraft_list if validate_aircraft_data(ac)]
+        return valid_aircraft
+    except Exception as e:
+        logger = logging.getLogger('adsb_logger')
+        logger.error(f"Error reading/parsing aircraft data from {path}: {e}")
+        return []
+
+
+# Legacy function kept for backward compatibility
+def upload_summary_to_database(aircraft_data, retry_count=0):
+    """Legacy function - use ADSBLogger.upload_summary_to_database instead."""
+    logger = logging.getLogger('adsb_logger')
+    logger.warning("Using legacy upload_summary_to_database function - consider updating to use ADSBLogger class")
+
+    if not aircraft_data:
+        logger.info("No aircraft summary data to upload.")
+        return True
+
+    logger.info(f"Attempting to upload summary for {len(aircraft_data)} unique aircraft...")
+    cnx = None
+    records = []
+    for hex_code, data in aircraft_data.items():
+        first_seen_ts = data.get('first_seen', time.time())
+        records.append({
+            'hex': hex_code, 'flight': data.get('flight'), 'alt_baro': data.get('alt_baro'),
+            'gs': data.get('gs'), 'track': data.get('track'),
+            'baro_rate': data.get('baro_rate'), 'squawk': data.get('squawk'), 'category': data.get('category'),
+            'messages': data.get('messages'), 'seen': data.get('seen'),
+            'lat': data.get('lat'), 'lon': data.get('lon'),
+            'registration': data.get('registration'), 'type_code': data.get('type_code'), 'long_type_name': data.get('long_type_name'),
+            'first_seen': datetime.fromtimestamp(first_seen_ts).strftime('%Y-%m-%d %H:%M:%S'),
+            'seen_count_increment': 1 if data.get('is_new_sighting', False) else 0
+        })
+
+    try:
+        cnx = mysql.connector.connect(**DB_CONFIG)
+        cursor = cnx.cursor()
+        # Process new sightings and existing aircraft separately
+        new_sighting_query = """
+        INSERT INTO tracked_aircraft (
+            hex, flight, alt_baro, gs, track, baro_rate, squawk,
+            category, messages, seen, lat, lon, registration, type_code, long_type_name,
+            seen_count, first_seen, last_seen
+        ) VALUES (
+            %(hex)s, %(flight)s, %(alt_baro)s, %(gs)s, %(track)s, %(baro_rate)s, %(squawk)s,
+            %(category)s, %(messages)s, %(seen)s, %(lat)s, %(lon)s, %(registration)s, %(type_code)s, %(long_type_name)s,
+            1, %(first_seen)s, NOW()
+        ) ON DUPLICATE KEY UPDATE
+            flight=VALUES(flight), alt_baro=VALUES(alt_baro), gs=VALUES(gs),
+            track=VALUES(track), baro_rate=VALUES(baro_rate), squawk=VALUES(squawk), category=VALUES(category),
+            messages=VALUES(messages), seen=VALUES(seen),
+            lat=VALUES(lat), lon=VALUES(lon),
+            registration=VALUES(registration), type_code=VALUES(type_code), long_type_name=VALUES(long_type_name),
+            seen_count = seen_count + 1,
+            last_seen=NOW()
+        """
+
+        existing_query = """
+        INSERT INTO tracked_aircraft (
+            hex, flight, alt_baro, gs, track, baro_rate, squawk,
+            category, messages, seen, lat, lon, registration, type_code, long_type_name,
+            seen_count, first_seen, last_seen
+        ) VALUES (
+            %(hex)s, %(flight)s, %(alt_baro)s, %(gs)s, %(track)s, %(baro_rate)s, %(squawk)s,
+            %(category)s, %(messages)s, %(seen)s, %(lat)s, %(lon)s, %(registration)s, %(type_code)s, %(long_type_name)s,
+            1, %(first_seen)s, NOW()
+        ) ON DUPLICATE KEY UPDATE
+            flight=VALUES(flight), alt_baro=VALUES(alt_baro), gs=VALUES(gs),
+            track=VALUES(track), baro_rate=VALUES(baro_rate), squawk=VALUES(squawk), category=VALUES(category),
+            messages=VALUES(messages), seen=VALUES(seen),
+            lat=VALUES(lat), lon=VALUES(lon),
+            registration=VALUES(registration), type_code=VALUES(type_code), long_type_name=VALUES(long_type_name),
+            last_seen=NOW()
+        """
+
+        # Separate records into new sightings and existing aircraft
+        new_sightings = []
+        existing_aircraft = []
+
+        for record in records:
+            if record['seen_count_increment'] == 1:
+                # Remove the seen_count_increment field for the query
+                clean_record = {k: v for k, v in record.items() if k != 'seen_count_increment'}
+                new_sightings.append(clean_record)
+            else:
+                # Remove the seen_count_increment field for the query
+                clean_record = {k: v for k, v in record.items() if k != 'seen_count_increment'}
+                existing_aircraft.append(clean_record)
+
+        total_rows = 0
+
+        # Execute new sightings (increment seen_count)
+        if new_sightings:
+            cursor.executemany(new_sighting_query, new_sightings)
+            total_rows += cursor.rowcount
+            logger.info(f"Processed {len(new_sightings)} new sightings (increment seen_count)")
+
+        # Execute existing aircraft updates (no increment)
+        if existing_aircraft:
+            cursor.executemany(existing_query, existing_aircraft)
+            total_rows += cursor.rowcount
+            logger.info(f"Updated {len(existing_aircraft)} existing aircraft (no increment)")
+
+        cnx.commit()
+        logger.info(f"SUCCESS: Committed {total_rows} summary changes to the database.")
+        return True
+    except mysql.connector.Error as err:
+        logger.error(f"DATABASE ERROR (summary): {err}")
+        if retry_count < config.MAX_RETRY_ATTEMPTS:
+            logger.info(f"Retrying summary upload in {config.RETRY_DELAY}s... ({retry_count + 1}/{config.MAX_RETRY_ATTEMPTS})")
+            time.sleep(config.RETRY_DELAY)
+            return upload_summary_to_database(aircraft_data, retry_count + 1)
+        else:
+            logger.error(f"Failed summary upload after {config.MAX_RETRY_ATTEMPTS} attempts.")
+            send_failure_email(f"Failed to upload summary: {err}")
+            return False
+    finally:
+        if cnx and cnx.is_connected(): cnx.close()
+
+
+def main():
+    """Legacy main function - use ADSBLogger().run() instead."""
+    logger = logging.getLogger('adsb_logger')
+    logger.warning("Using legacy main function - consider updating to use ADSBLogger().run()")
+
+    previously_seen_hexes = set()
+    local_aircraft_cache = {}
+    last_summary_upload_time = time.time()
+
+    logger.info(f"Starting ADSB Logger - Summary upload interval: {config.SUMMARY_UPLOAD_INTERVAL/60:.1f} minutes")
+
+    while True:
+        try:
+            current_time = time.time()
+
+            # Read all aircraft data
+            all_aircraft = read_aircraft_json(config.AIRCRAFT_JSON_PATH)
+
+            # Update the summary cache
+            current_hexes = {ac['hex'] for ac in all_aircraft if 'hex' in ac}
+            if all_aircraft:
+                now = time.time()
+                for ac in all_aircraft:
+                    hex_code = ac.get('hex')
+                    if not hex_code: continue
+
+                    if hex_code in local_aircraft_cache:
+                        # Update existing entry but preserve first_seen
+                        first_seen = local_aircraft_cache[hex_code].get('first_seen')
+                        local_aircraft_cache[hex_code] = ac
+                        if first_seen: local_aircraft_cache[hex_code]['first_seen'] = first_seen
+                    else:
+                        # Add new entry
+                        local_aircraft_cache[hex_code] = ac
+                        local_aircraft_cache[hex_code]['first_seen'] = now
+
+                    # Mark if it's a new sighting in this cycle for seen_count increment
+                    if hex_code not in previously_seen_hexes:
+                        local_aircraft_cache[hex_code]['is_new_sighting'] = True
+                    else:
+                        # Ensure flag is not carried over from a previous upload cycle
+                        local_aircraft_cache[hex_code]['is_new_sighting'] = False
+
+            previously_seen_hexes = current_hexes
+            logger.debug(f"Cache status: {len(local_aircraft_cache)} total aircraft cached.")
+
+            # Check if it's time to upload the summary
+            should_upload = (current_time - last_summary_upload_time >= config.SUMMARY_UPLOAD_INTERVAL or
+                             len(local_aircraft_cache) >= config.MAX_CACHE_SIZE)
+
+            if should_upload and local_aircraft_cache:
+                logger.info("Initiating summary data upload...")
+                if len(local_aircraft_cache) >= config.MAX_CACHE_SIZE:
+                    logger.warning(f"Cache size limit reached ({len(local_aircraft_cache)}), forcing upload.")
+
+                if upload_summary_to_database(local_aircraft_cache):
+                    last_summary_upload_time = current_time
+                    # Clear the 'is_new_sighting' flag for all cached items after upload
+                    for hex_code in local_aircraft_cache:
+                        local_aircraft_cache[hex_code]['is_new_sighting'] = False
+                    logger.info("Summary upload complete.")
+                else:
+                    logger.warning("Summary upload failed, keeping cache for next attempt.")
+
+            logger.debug("Sleeping for 60 seconds...")
+            time.sleep(60)
+
+        except KeyboardInterrupt:
+            logger.info("Shutdown signal received. Attempting final summary upload...")
+            if local_aircraft_cache:
+                upload_summary_to_database(local_aircraft_cache)
+            logger.info("Shutdown complete.")
+            break
+        except Exception as e:
+            logger.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+            time.sleep(60)
+
 
 if __name__ == "__main__":
     # Use the new production-ready ADSBLogger class
