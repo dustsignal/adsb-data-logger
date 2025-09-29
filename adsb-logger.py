@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 """
-========================================================
-ADS-B Aircraft Tracking System with fun console output.
-=======================================================
+===========================================
+ADS-B Data Logging and Visualization System
+===========================================
+
+ADS-B (Automatic Dependent Surveillance-Broadcast) aircraft tracking system that 
+collects, processes, and visualizes aircraft data with near real-time console display.
+
+Features:
+- Real-time aircraft data collection from dump1090, dump1090-fa, or tar1090
+- MySQL database storage with connection pooling
+- Dynamic console dashboard with aircraft tracking
+- Email notifications on failures
+- Automatic log file cleanup every 48 hours
+- Circuit breaker pattern for resilience
+- TTL caching for performance
+- Aircraft registry enrichment from CSV data
+
+Author: dustsignal
+License: MIT
+Repository: https://github.com/dustsignal/adsb-logger
 """
 
 import json
@@ -40,11 +57,13 @@ class Configuration:
     """
 
     # --- DATA SOURCE CONFIGURATION ---
-    # URL or file path to aircraft.json data source (dump1090-fa or tar1090)
-    AIRCRAFT_JSON_PATH = os.getenv('AIRCRAFT_JSON_PATH', 'your-path/aircraft.json')
+    # URL or file path to aircraft.json data source (dump1090, dump1090-fa, or tar1090)
+    # Replace with your actual data source URL or local file path
+    AIRCRAFT_JSON_PATH = os.getenv('AIRCRAFT_JSON_PATH', 'http://YOUR_SERVER_IP/YOUR_PATH/aircraft.json')
 
     # URL to aircraft CSV file for aircraft registry data (registration, type, etc.)
-    AIRCRAFT_CSV_PATH = os.getenv('AIRCRAFT_CSV_PATH', 'your-path/aircraft.csv')
+    # Replace with your actual aircraft CSV source URL
+    AIRCRAFT_CSV_PATH = os.getenv('AIRCRAFT_CSV_PATH', 'http://YOUR_SERVER_IP/YOUR_PATH/aircraft.csv')
 
     # --- TIMING CONFIGURATION ---
     # How often to upload summary data to database (seconds) - Default: 5 minutes
@@ -76,14 +95,14 @@ class Configuration:
     CIRCUIT_BREAKER_TIMEOUT = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT', '60'))
 
     # --- DATABASE CONFIGURATION ---
-    # Database connection pool size
+    # Database connection pool size - Number of concurrent connections to maintain
     DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
 
-    # Database connection settings
-    DB_USER = os.getenv('DB_USER', 'datbase-username')
-    DB_PASSWORD = os.getenv('DB_PASSWORD', 'password')
-    DB_HOST = os.getenv('DB_HOST', 'localhost or server address')
-    DB_NAME = os.getenv('DB_NAME', 'database-name')
+    # Database connection settings - Replace with your actual database credentials
+    DB_USER = os.getenv('DB_USER', 'your_database_username')
+    DB_PASSWORD = os.getenv('DB_PASSWORD', 'your_database_password')
+    DB_HOST = os.getenv('DB_HOST', 'your-database-host.com')
+    DB_NAME = os.getenv('DB_NAME', 'your_database_name')
 
     # --- LOGGING CONFIGURATION ---
     # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -99,22 +118,22 @@ class Configuration:
     LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))
 
     # --- EMAIL NOTIFICATION CONFIGURATION ---
-    # SMTP server settings for failure notifications
-    SMTP_SERVER = os.getenv('SMTP_SERVER', 'mail.domain.com')
-    SMTP_PORT = int(os.getenv('SMTP_PORT', '465'))
-    SENDER_EMAIL = os.getenv('SENDER_EMAIL', 'admin@domain.com')
-    SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', 'password')
-    RECEIVER_EMAIL = os.getenv('RECEIVER_EMAIL', 'user@domain.com')
+    # SMTP server settings for failure notifications - Replace with your email provider settings
+    SMTP_SERVER = os.getenv('SMTP_SERVER', 'your-smtp-server.com')  # e.g., smtp.gmail.com
+    SMTP_PORT = int(os.getenv('SMTP_PORT', '465'))  # 465 for SSL, 587 for TLS
+    SENDER_EMAIL = os.getenv('SENDER_EMAIL', 'your-sender-email@domain.com')
+    SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', 'your-email-password-or-app-password')
+    RECEIVER_EMAIL = os.getenv('RECEIVER_EMAIL', 'your-notification-email@domain.com')
 
 # Create global configuration instance
 config = Configuration()
 
 # Database configuration dictionary for MySQL connector
 DB_CONFIG = {
-    'user': config.DB_USER,
-    'password': config.DB_PASSWORD,
-    'host': config.DB_HOST,
-    'database': config.DB_NAME,
+    'user': config.DB_USER,  # Gets value from Config instance
+    'password': config.DB_PASSWORD,  # Gets value from Config instance
+    'host': config.DB_HOST,  # Gets value from Config instance
+    'database': config.DB_NAME,  # Gets value from Config instance
     'raise_on_warnings': False,
     'connection_timeout': 30,
     'autocommit': False,
@@ -162,10 +181,10 @@ class DynamicConsoleHandler(logging.StreamHandler):
     """
     Custom logging handler that manages the dynamic dashboard display.
 
-    This handler works with the ApplicationFormatter to provide
-    real-time dashboard updates while maintaining proper logging
-    functionality. It ensures that log messages are properly
-    formatted and displayed without interfering with the dashboard.
+    Works with the ApplicationFormatter to provide real-time dashboard
+    updates while maintaining proper logging functionality. Ensures that
+    log messages are properly formatted and displayed without interfering
+    with the dashboard.
     """
 
     def __init__(self):
@@ -193,9 +212,9 @@ class ApplicationFormatter(logging.Formatter):
     """
     Custom formatter for application-like console output with dynamic updates.
 
-    This formatter creates a professional-looking dashboard interface that
-    updates in real-time. It manages terminal control sequences, status
-    tracking, and message filtering to provide a clean, informative display.
+    Creates a professional-looking dashboard interface that updates in
+    real-time. Manages terminal control sequences, status tracking, and
+    message filtering to provide a clean, informative display.
 
     Features:
     - Real-time dashboard with aircraft tracking
@@ -224,9 +243,9 @@ class ApplicationFormatter(logging.Formatter):
         """
         Format a log record for display.
 
-        Handles the core logic of what gets displayed
-        on the console vs what gets filtered out. It manages the
-        dynamic dashboard updates and ensures clean output.
+        Handles the core logic of what gets displayed on the console
+        vs what gets filtered out. Manages dynamic dashboard updates
+        and ensures clean output.
 
         Args:
             record: The LogRecord to format
@@ -291,9 +310,9 @@ class ApplicationFormatter(logging.Formatter):
         """
         Handle dynamic dashboard updates with atomic state management.
 
-        Processes messages that should trigger dashboard
-        updates. It uses thread-safe operations to ensure the dashboard
-        state remains consistent during concurrent updates.
+        Processes messages that should trigger dashboard updates.
+        Uses thread-safe operations to ensure the dashboard state
+        remains consistent during concurrent updates.
 
         Args:
             timestamp (str): Formatted timestamp string
@@ -357,8 +376,8 @@ class ApplicationFormatter(logging.Formatter):
         """
         Update the current aircraft data for display.
 
-        Method allows external components to update
-        the aircraft data that's displayed in the dashboard.
+        Allows external components to update the aircraft data
+        that's displayed in the dashboard.
 
         Args:
             aircraft_list (list): List of aircraft dictionaries
@@ -369,9 +388,9 @@ class ApplicationFormatter(logging.Formatter):
         """
         Schedule a status change after a delay with consolidated refresh.
 
-        Allows status changes to be visible for a certain
-        period before automatically transitioning to the next status.
-        It's useful for showing temporary states like "UPLOADING" or
+        Allows status changes to be visible for a certain period
+        before automatically transitioning to the next status.
+        Useful for showing temporary states like "UPLOADING" or
         "UPLOAD SUCCESS" before returning to "STANDBY".
 
         Args:
@@ -400,9 +419,9 @@ class ApplicationFormatter(logging.Formatter):
         """
         Schedule a single consolidated dashboard refresh to prevent duplicates.
 
-        Prevents multiple rapid refreshes by consolidating
-        them into a single refresh operation. This improves performance
-        and reduces screen flicker during busy periods.
+        Prevents multiple rapid refreshes by consolidating them into
+        a single refresh operation. Improves performance and reduces
+        screen flicker during busy periods.
         """
         import time
         import threading
@@ -434,8 +453,8 @@ class ApplicationFormatter(logging.Formatter):
         Refresh the dashboard display with proper terminal control and synchronization.
 
         Handles the actual terminal updates, cursor positioning,
-        and screen clearing. It uses ANSI escape sequences to manage the
-        display and ensure clean, flicker-free updates.
+        and screen clearing. Uses ANSI escape sequences to manage
+        the display and ensure clean, flicker-free updates.
         """
         import sys
         import time
@@ -595,10 +614,10 @@ class ApplicationFormatter(logging.Formatter):
         """
         Generate compact aircraft list display with formatted header.
 
-        This creates a table showing currently tracked aircraft
-        with their details including hex codes, registration, aircraft type,
-        altitude, speed, and flight number. The display is limited to
-        15 aircraft to prevent screen clutter.
+        Creates a table showing currently tracked aircraft with their
+        details including hex codes, registration, aircraft type, altitude,
+        speed, and flight number. The display is limited to 15 aircraft
+        to prevent screen clutter.
 
         Returns:
             str: Formatted aircraft display table
@@ -685,9 +704,9 @@ class ApplicationFormatter(logging.Formatter):
         """
         Build the complete dashboard display based on incoming messages.
 
-        This updates the global dashboard state based on the type
-        of message received. It parses message content to extract relevant
-        information and updates status indicators accordingly.
+        Updates the global dashboard state based on the type of message
+        received. Parses message content to extract relevant information
+        and updates status indicators accordingly.
 
         Args:
             timestamp (str): Formatted timestamp string
@@ -774,8 +793,8 @@ class ApplicationFormatter(logging.Formatter):
         elif ApplicationFormatter.current_status == "STANDBY":
             status_color = Colors.DIM
 
-        # no longer used - replaced by _get_current_dashboard
-        # return ""
+        # No longer used - replaced by _get_current_dashboard
+        return ""
 
     def _format_error(self, timestamp, msg):
         """
@@ -825,7 +844,7 @@ class LogFileManager:
     Manages log file cleanup operations.
 
     Handles automatic log file cleanup every 48 hours (configurable)
-    to prevent log files from growing indefinitely. It provides thread-safe
+    to prevent log files from growing indefinitely. Provides thread-safe
     operations and detailed logging of cleanup activities.
 
     Features:
@@ -864,9 +883,9 @@ class LogFileManager:
         """
         Empty the log file and reset the cleanup timer.
 
-        Safely empties the log file while preserving it for
-        continued logging. It records the cleanup operation with timestamp
-        and file size information for audit purposes.
+        Safely empties the log file while preserving it for continued
+        logging. Records the cleanup operation with timestamp and file
+        size information for audit purposes.
 
         Returns:
             bool: True if cleanup succeeded, False otherwise
@@ -932,9 +951,9 @@ def setup_logging() -> logging.Logger:
     """
     Set up structured logging with rotating file handlers.
 
-    This function configures both file and console logging with appropriate
-    formatters and handlers. The console uses the custom ApplicationFormatter
-    for dashboard display, while files use standard detailed formatting.
+    Configures both file and console logging with appropriate formatters
+    and handlers. The console uses the custom ApplicationFormatter for
+    dashboard display, while files use standard detailed formatting.
 
     Returns:
         logging.Logger: Configured logger instance
@@ -1396,9 +1415,9 @@ class DatabaseManager:
     """
     Database connection pool manager with automatic cleanup.
 
-    Manages a pool of MySQL database connections to provide
-    efficient and reliable database access. It handles connection pooling,
-    automatic cleanup, and transaction management.
+    Manages a pool of MySQL database connections to provide efficient
+    and reliable database access. Handles connection pooling, automatic
+    cleanup, and transaction management.
 
     Features:
     - Connection pooling for performance
@@ -1613,8 +1632,8 @@ class ADSBLogger:
         """
         Validate aircraft data before processing.
 
-        Ensures that aircraft data meets minimum requirements
-        and has valid data types for all fields.
+        Ensures that aircraft data meets minimum requirements and has
+        valid data types for all fields.
 
         Args:
             aircraft (Dict[str, Any]): Aircraft data dictionary to validate
@@ -1644,8 +1663,8 @@ class ADSBLogger:
         """
         Read and parse the aircraft.json file or URL with validation.
 
-        Fetches aircraft data from either a local file or
-        HTTP URL, validates the data, and returns a list of valid aircraft.
+        Fetches aircraft data from either a local file or HTTP URL,
+        validates the data, and returns a list of valid aircraft.
 
         Args:
             path (str): File path or URL to aircraft.json
@@ -1684,8 +1703,8 @@ class ADSBLogger:
         """
         Connect to the database and upload the cached aircraft summary data.
 
-        Handles the complex process of uploading aircraft data
-        to the database, including handling new sightings vs. existing aircraft
+        Handles the complex process of uploading aircraft data to the
+        database, including handling new sightings vs. existing aircraft
         updates, retry logic, and transaction management.
 
         Args:
@@ -1965,11 +1984,9 @@ class ADSBLogger:
                             if not self.first_scan_complete:
                                 self.first_scan_complete = True
                                 self.logger.info("Initial upload complete. Switching to timer/cache-based upload cycle.")
-                            # Clear the 'is_new_sighting' flag for all cached items after upload
-                            for hex_code, aircraft_data in self.local_aircraft_cache.items():
-                                aircraft_data['is_new_sighting'] = False
-                                self.local_aircraft_cache.put(hex_code, aircraft_data)
-                            self.logger.info("Summary upload complete.")
+                            # Clear the cache after successful upload
+                            self.local_aircraft_cache.clear()
+                            self.logger.info("Summary upload complete. Cache cleared.")
                         else:
                             self.logger.warning("Summary upload failed, keeping cache for next attempt.")
                     except Exception as upload_error:
@@ -2253,9 +2270,9 @@ def main():
     """
     Legacy main function - use ADSBLogger().run() instead.
 
-    This function provides backward compatibility for older versions
-    of the script that used a procedural approach instead of the
-    object-oriented ADSBLogger class.
+    Provides backward compatibility for older versions of the script
+    that used a procedural approach instead of the object-oriented
+    ADSBLogger class.
     """
     logger = logging.getLogger('adsb_logger')
     logger.warning("Using legacy main function - consider updating to use ADSBLogger().run()")
@@ -2314,10 +2331,9 @@ def main():
 
                 if upload_summary_to_database(local_aircraft_cache):
                     last_summary_upload_time = current_time
-                    # Clear the 'is_new_sighting' flag for all cached items after upload
-                    for hex_code in local_aircraft_cache:
-                        local_aircraft_cache[hex_code]['is_new_sighting'] = False
-                    logger.info("Summary upload complete.")
+                    # Clear the cache after successful upload
+                    local_aircraft_cache.clear()
+                    logger.info("Summary upload complete. Cache cleared.")
                 else:
                     logger.warning("Summary upload failed, keeping cache for next attempt.")
 
